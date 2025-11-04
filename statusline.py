@@ -4,6 +4,15 @@ import json, sys, os, subprocess, io
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Configuration: Toggle between time calculation methods
+# Set to True to use fixed cycle times (6h, 11h, 16h, 21h)
+# Set to False to use original 5-hour block calculation
+USE_FIXED_CYCLES = True
+
+# Configuration: Cost limit per 5-hour session (Claude Pro)
+# Adjust this based on your plan
+COST_LIMIT_PER_SESSION = 5.0  # $5 per 5 hours for Claude Pro
+
 # Fix encoding on Windows
 if sys.platform == "win32":
     sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
@@ -193,26 +202,116 @@ def format_time_remaining(start_time):
     except Exception:
         return None, None, 0
 
+def calculate_fixed_cycle_time_remaining():
+    """
+    Calculate time remaining until next fixed cycle reset
+    Cycles are at: 6:00, 11:00, 16:00, 21:00 daily
+    Returns: (hours, minutes, total_seconds, next_reset_time)
+    """
+    try:
+        # Define cycle times in 24-hour format
+        cycle_hours = [6, 11, 16, 21]
+
+        # Get current time
+        now = datetime.now()
+        current_hour = now.hour
+        current_minute = now.minute
+
+        # Find next cycle time
+        next_cycle_hour = None
+        for cycle_hour in cycle_hours:
+            if current_hour < cycle_hour or (current_hour == cycle_hour and current_minute < 0):
+                next_cycle_hour = cycle_hour
+                break
+
+        # If no cycle found today, use first cycle of next day
+        if next_cycle_hour is None:
+            next_cycle_hour = cycle_hours[0]
+            next_reset = now.replace(hour=next_cycle_hour, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            next_reset = now.replace(hour=next_cycle_hour, minute=0, second=0, microsecond=0)
+
+        # Calculate remaining time
+        remaining = next_reset - now
+        total_seconds = int(remaining.total_seconds())
+
+        if total_seconds <= 0:
+            return None, None, 0, None
+
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+
+        return hours, minutes, total_seconds, next_reset
+    except Exception:
+        return None, None, 0, None
+
 def get_usage_info_from_ccusage():
     """Get usage information from ccusage command"""
     try:
-        # Check if ccusage is available
-        result = subprocess.run(
-            ["ccusage", "blocks", "--json"],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='ignore',
-            timeout=5
-        )
+        # Try to find ccusage command
+        ccusage_cmd = "ccusage"
+
+        # On Windows, try common npm global paths
+        if sys.platform == "win32":
+            possible_paths = [
+                "ccusage",  # Try PATH first
+                os.path.expandvars("%APPDATA%\\npm\\ccusage.cmd"),
+                os.path.expandvars("%USERPROFILE%\\AppData\\Roaming\\npm\\ccusage.cmd"),
+            ]
+
+            # Try fnm paths
+            appdata_roaming = os.path.expandvars("%APPDATA%")
+            if os.path.exists(os.path.join(appdata_roaming, "fnm")):
+                # Look for ccusage in fnm node versions
+                fnm_dir = os.path.join(appdata_roaming, "fnm", "node-versions")
+                if os.path.exists(fnm_dir):
+                    for version_dir in os.listdir(fnm_dir):
+                        ccusage_path = os.path.join(fnm_dir, version_dir, "installation", "ccusage.cmd")
+                        if os.path.exists(ccusage_path):
+                            possible_paths.append(ccusage_path)
+                            break
+        else:
+            possible_paths = ["ccusage"]
+
+        # Try each possible command
+        for cmd in possible_paths:
+            try:
+                result = subprocess.run(
+                    [cmd, "blocks", "--json"],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                    timeout=5,
+                    shell=True if sys.platform == "win32" else False
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    break
+            except (FileNotFoundError, OSError):
+                continue
+        else:
+            return None
 
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             blocks = data.get('blocks', [])
 
-            # Find active block
+            # Find active block first
             for block in blocks:
                 if block.get('isActive'):
+                    return {
+                        'start_time': block.get('startTime'),
+                        'reset_time': block.get('usageLimitResetTime') or block.get('endTime'),
+                        'total_tokens': block.get('totalTokens', 0),
+                        'cost_usd': block.get('costUSD', 0),
+                        'tokens_per_minute': block.get('burnRate', {}).get('tokensPerMinute', 0),
+                        'entries': block.get('entries', 0)
+                    }
+
+            # Fallback: Find most recent non-gap block
+            for block in reversed(blocks):
+                if not block.get('isGap'):
                     return {
                         'start_time': block.get('startTime'),
                         'reset_time': block.get('usageLimitResetTime') or block.get('endTime'),
@@ -290,8 +389,46 @@ try:
         git_icon = "🔴" if is_dirty else "🌿"
         parts.append(f"{Colors.GREEN}{git_icon} {branch}{Colors.RESET}")
 
+    # Session timer - Choose calculation method based on configuration
+    if USE_FIXED_CYCLES:
+        # Use fixed cycle times (6h, 11h, 16h, 21h)
+        hours_left, minutes_left, seconds_left, next_reset = calculate_fixed_cycle_time_remaining()
+        if seconds_left and seconds_left > 0:
+            # Color based on remaining time
+            if seconds_left > 3600:  # More than 1 hour
+                time_color = Colors.GREEN
+            elif seconds_left > 1800:  # More than 30 minutes
+                time_color = Colors.YELLOW
+            else:
+                time_color = Colors.RED
+
+            # Format time string
+            if hours_left and hours_left > 0:
+                time_str = f"{hours_left}h {minutes_left}m"
+            else:
+                time_str = f"{minutes_left}m"
+
+            # Format reset time
+            reset_hm = next_reset.strftime("%H:%M") if next_reset else ""
+
+            # Calculate usage percentage based on cost
+            usage_pct = 0
+            if usage_info:
+                current_cost = usage_info.get('cost_usd', 0)
+                if current_cost > 0:
+                    usage_pct = int((current_cost / COST_LIMIT_PER_SESSION) * 100)
+                    usage_pct = max(0, min(100, usage_pct))  # Clamp to 0-100%
+
+            # Build session info with usage percentage
+            if usage_pct > 0:
+                session_info = f"⏱ {time_str} until reset at {reset_hm} ({usage_pct}%)"
+            else:
+                session_info = f"⏱ {time_str} until reset at {reset_hm}"
+
+            parts.append(f"{time_color}{session_info}{Colors.RESET}")
+
     # Session timer from ccusage (prioritize over block_start)
-    if usage_info and usage_info.get('reset_time'):
+    elif usage_info and usage_info.get('reset_time'):
         try:
             reset_time = datetime.fromisoformat(usage_info['reset_time'].replace('Z', '+00:00'))
             now = datetime.now(reset_time.tzinfo)
